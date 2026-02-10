@@ -1,10 +1,17 @@
 import type { SeverityNumber } from "@opentelemetry/api-logs";
 import type { DiagnosticEventPayload, OpenClawPluginService } from "openclaw/plugin-sdk";
-import { metrics, trace, SpanStatusCode } from "@opentelemetry/api";
+import {
+  diag,
+  DiagConsoleLogger,
+  DiagLogLevel,
+  metrics,
+  trace,
+  SpanStatusCode,
+} from "@opentelemetry/api";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
-import { Resource } from "@opentelemetry/resources";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
 import { PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
@@ -48,9 +55,11 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
   return {
     id: "diagnostics-otel",
     async start(ctx) {
+      ctx.logger.info("diagnostics-otel: start() called [v1]");
       const cfg = ctx.config.diagnostics;
       const otel = cfg?.otel;
       if (!cfg?.enabled || !otel?.enabled) {
+        ctx.logger.info("diagnostics-otel: disabled in config");
         return;
       }
 
@@ -73,13 +82,16 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
         return;
       }
 
-      const resource = new Resource({
+      const resource = resourceFromAttributes({
         [SemanticResourceAttributes.SERVICE_NAME]: serviceName,
       });
 
       const traceUrl = resolveOtelUrl(endpoint, "v1/traces");
       const metricUrl = resolveOtelUrl(endpoint, "v1/metrics");
       const logUrl = resolveOtelUrl(endpoint, "v1/logs");
+      ctx.logger.info(
+        `diagnostics-otel: endpoint=${endpoint} traceUrl=${traceUrl} metricUrl=${metricUrl} logUrl=${logUrl} sampleRate=${sampleRate} serviceName=${serviceName}`,
+      );
       const traceExporter = tracesEnabled
         ? new OTLPTraceExporter({
             ...(traceUrl ? { url: traceUrl } : {}),
@@ -103,6 +115,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
           })
         : undefined;
 
+      // Enable OTel internal diagnostics to capture trace exporter errors
+      diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.DEBUG);
+
       if (tracesEnabled || metricsEnabled) {
         sdk = new NodeSDK({
           resource,
@@ -118,6 +133,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
         });
 
         sdk.start();
+        ctx.logger.info(
+          `diagnostics-otel: sdk started, tracerProvider=${trace.getTracerProvider()?.constructor?.name ?? "unknown"}`,
+        );
       }
 
       const logSeverityMap: Record<string, SeverityNumber> = {
@@ -210,15 +228,15 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
           ...(logUrl ? { url: logUrl } : {}),
           ...(headers ? { headers } : {}),
         });
-        logProvider = new LoggerProvider({ resource });
-        logProvider.addLogRecordProcessor(
-          new BatchLogRecordProcessor(
-            logExporter,
-            typeof otel.flushIntervalMs === "number"
-              ? { scheduledDelayMillis: Math.max(1000, otel.flushIntervalMs) }
-              : {},
-          ),
-        );
+        const logProcessor = new BatchLogRecordProcessor(logExporter, {
+          ...(typeof otel.flushIntervalMs === "number"
+            ? { scheduledDelayMillis: Math.max(1000, otel.flushIntervalMs) }
+            : {}),
+        });
+        logProvider = new LoggerProvider({
+          resource,
+          processors: [logProcessor],
+        });
         const otelLogger = logProvider.getLogger("openclaw");
 
         stopLogTransport = registerLogTransport((logObj) => {
@@ -247,6 +265,8 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
           const logLevelName = meta?.logLevelName ?? "INFO";
           const severityNumber = logSeverityMap[logLevelName] ?? (9 as SeverityNumber);
 
+          ctx.logger.info(`diagnostics-otel: log ${logLevelName} ${safeStringify(logObj)}`);
+
           const numericArgs = Object.entries(logObj)
             .filter(([key]) => /^\d+$/.test(key))
             .toSorted((a, b) => Number(a[0]) - Number(b[0]))
@@ -260,8 +280,10 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
                 bindings = parsed as Record<string, unknown>;
                 numericArgs.shift();
               }
-            } catch {
-              // ignore malformed json bindings
+            } catch (err) {
+              ctx.logger.info(
+                `diagnostics-otel: log malformed json bindings: ${err} raw=${numericArgs[0]}`,
+              );
             }
           }
 
@@ -314,6 +336,7 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
             attributes["openclaw.code.location"] = meta.path.filePathWithLine;
           }
 
+          ctx.logger.info(`diagnostics-otel: log emit message=${message}`);
           otelLogger.emit({
             body: message,
             severityText: logLevelName,
@@ -335,10 +358,16 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
           attributes,
           ...(startTime ? { startTime } : {}),
         });
+        ctx.logger.info(
+          `diagnostics-otel: span created name=${name} durationMs=${durationMs} spanId=${span.spanContext?.().spanId ?? "N/A"} traceId=${span.spanContext?.().traceId ?? "N/A"}`,
+        );
         return span;
       };
 
       const recordModelUsage = (evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordModelUsage tracesEnabled=${tracesEnabled} metricsEnabled=${metricsEnabled} provider=${evt.provider} model=${evt.model} durationMs=${evt.durationMs}`,
+        );
         const attrs = {
           "openclaw.channel": evt.channel ?? "unknown",
           "openclaw.provider": evt.provider ?? "unknown",
@@ -405,6 +434,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordWebhookReceived = (
         evt: Extract<DiagnosticEventPayload, { type: "webhook.received" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordWebhookReceived channel=${evt.channel} updateType=${evt.updateType}`,
+        );
         const attrs = {
           "openclaw.channel": evt.channel ?? "unknown",
           "openclaw.webhook": evt.updateType ?? "unknown",
@@ -415,6 +447,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordWebhookProcessed = (
         evt: Extract<DiagnosticEventPayload, { type: "webhook.processed" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordWebhookProcessed tracesEnabled=${tracesEnabled} channel=${evt.channel} durationMs=${evt.durationMs}`,
+        );
         const attrs = {
           "openclaw.channel": evt.channel ?? "unknown",
           "openclaw.webhook": evt.updateType ?? "unknown",
@@ -436,6 +471,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordWebhookError = (
         evt: Extract<DiagnosticEventPayload, { type: "webhook.error" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordWebhookError tracesEnabled=${tracesEnabled} channel=${evt.channel} error=${evt.error}`,
+        );
         const attrs = {
           "openclaw.channel": evt.channel ?? "unknown",
           "openclaw.webhook": evt.updateType ?? "unknown",
@@ -461,6 +499,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordMessageQueued = (
         evt: Extract<DiagnosticEventPayload, { type: "message.queued" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordMessageQueued channel=${evt.channel} source=${evt.source} queueDepth=${evt.queueDepth}`,
+        );
         const attrs = {
           "openclaw.channel": evt.channel ?? "unknown",
           "openclaw.source": evt.source ?? "unknown",
@@ -474,6 +515,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordMessageProcessed = (
         evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordMessageProcessed tracesEnabled=${tracesEnabled} metricsEnabled=${metricsEnabled} logsEnabled=${logsEnabled} outcome=${evt.outcome} durationMs=${evt.durationMs}`,
+        );
         const attrs = {
           "openclaw.channel": evt.channel ?? "unknown",
           "openclaw.outcome": evt.outcome ?? "unknown",
@@ -511,6 +555,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordLaneEnqueue = (
         evt: Extract<DiagnosticEventPayload, { type: "queue.lane.enqueue" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordLaneEnqueue lane=${evt.lane} queueSize=${evt.queueSize}`,
+        );
         const attrs = { "openclaw.lane": evt.lane };
         laneEnqueueCounter.add(1, attrs);
         queueDepthHistogram.record(evt.queueSize, attrs);
@@ -519,6 +566,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordLaneDequeue = (
         evt: Extract<DiagnosticEventPayload, { type: "queue.lane.dequeue" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordLaneDequeue lane=${evt.lane} queueSize=${evt.queueSize} waitMs=${evt.waitMs}`,
+        );
         const attrs = { "openclaw.lane": evt.lane };
         laneDequeueCounter.add(1, attrs);
         queueDepthHistogram.record(evt.queueSize, attrs);
@@ -530,6 +580,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordSessionState = (
         evt: Extract<DiagnosticEventPayload, { type: "session.state" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordSessionState state=${evt.state} reason=${evt.reason}`,
+        );
         const attrs: Record<string, string> = { "openclaw.state": evt.state };
         if (evt.reason) {
           attrs["openclaw.reason"] = evt.reason;
@@ -540,6 +593,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const recordSessionStuck = (
         evt: Extract<DiagnosticEventPayload, { type: "session.stuck" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordSessionStuck tracesEnabled=${tracesEnabled} state=${evt.state} ageMs=${evt.ageMs}`,
+        );
         const attrs: Record<string, string> = { "openclaw.state": evt.state };
         sessionStuckCounter.add(1, attrs);
         if (typeof evt.ageMs === "number") {
@@ -563,16 +619,23 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       };
 
       const recordRunAttempt = (evt: Extract<DiagnosticEventPayload, { type: "run.attempt" }>) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordRunAttempt attempt=${evt.attempt} runId=${evt.runId}`,
+        );
         runAttemptCounter.add(1, { "openclaw.attempt": evt.attempt });
       };
 
       const recordHeartbeat = (
         evt: Extract<DiagnosticEventPayload, { type: "diagnostic.heartbeat" }>,
       ) => {
+        ctx.logger.info(
+          `diagnostics-otel: recordHeartbeat active=${evt.active} waiting=${evt.waiting} queued=${evt.queued}`,
+        );
         queueDepthHistogram.record(evt.queued, { "openclaw.channel": "heartbeat" });
       };
 
       unsubscribe = onDiagnosticEvent((evt: DiagnosticEventPayload) => {
+        ctx.logger.info(`diagnostics-otel: received event [v1] type=${evt.type}`);
         switch (evt.type) {
           case "model.usage":
             recordModelUsage(evt);
@@ -612,9 +675,16 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
             return;
         }
       });
+      ctx.logger.info("diagnostics-otel: event listener registered [v1]");
 
       if (logsEnabled) {
         ctx.logger.info("diagnostics-otel: logs exporter enabled (OTLP/HTTP)");
+      }
+      if (tracesEnabled) {
+        ctx.logger.info("diagnostics-otel: traces exporter enabled (OTLP/HTTP)");
+      }
+      if (metricsEnabled) {
+        ctx.logger.info("diagnostics-otel: metrics exporter enabled (OTLP/HTTP)");
       }
     },
     async stop() {

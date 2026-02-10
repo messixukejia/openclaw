@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../config/config.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 
 export type DiagnosticSessionState = "idle" | "processing" | "waiting";
 
@@ -146,34 +147,79 @@ export type DiagnosticEventInput = DiagnosticEventPayload extends infer Event
     ? Omit<Event, "seq" | "ts">
     : never
   : never;
-let seq = 0;
-const listeners = new Set<(evt: DiagnosticEventPayload) => void>();
+type DiagnosticGlobalState = {
+  seq: number;
+  listeners: Set<(evt: DiagnosticEventPayload) => void>;
+  _stateId: string;
+};
+
+type GlobalWithDiagnosticState = typeof globalThis & {
+  __openclaw_diagnostic_state__?: DiagnosticGlobalState;
+};
+
+const DIAGNOSTIC_STATE_KEY = "__openclaw_diagnostic_state__";
+
+const diagnosticEventsLogger = createSubsystemLogger("diagnostic/events");
+
+function getGlobalDiagnosticState(): DiagnosticGlobalState {
+  const globalWithState = globalThis as GlobalWithDiagnosticState;
+  let state = globalWithState[DIAGNOSTIC_STATE_KEY];
+  if (!state) {
+    state = {
+      seq: 0,
+      listeners: new Set(),
+      _stateId: Math.random().toString(36).slice(2, 8),
+    };
+    globalWithState[DIAGNOSTIC_STATE_KEY] = state;
+  }
+  return state;
+}
 
 export function isDiagnosticsEnabled(config?: OpenClawConfig): boolean {
   return config?.diagnostics?.enabled === true;
 }
 
 export function emitDiagnosticEvent(event: DiagnosticEventInput) {
+  const state = getGlobalDiagnosticState();
   const enriched = {
     ...event,
-    seq: (seq += 1),
+    seq: (state.seq += 1),
     ts: Date.now(),
   } satisfies DiagnosticEventPayload;
-  for (const listener of listeners) {
+  // Basic debug log for emission entry
+  // This helps verify that the core is actually emitting diagnostics events
+  // and what type/sequence they have.
+  // Kept lightweight to avoid depending on the logging subsystem here.
+  diagnosticEventsLogger.info("[diagnostic v1] emit", {
+    type: enriched.type,
+    seq: enriched.seq,
+    stateId: state._stateId,
+    listeners: state.listeners.size,
+  });
+  for (const listener of state.listeners) {
     try {
       listener(enriched);
-    } catch {
-      // Ignore listener failures.
+    } catch (err) {
+      diagnosticEventsLogger.error("[diagnostic v1] listener threw", {
+        error: String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
     }
   }
 }
 
 export function onDiagnosticEvent(listener: (evt: DiagnosticEventPayload) => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  const state = getGlobalDiagnosticState();
+  state.listeners.add(listener);
+  diagnosticEventsLogger.info("[diagnostic v1] onDiagnosticEvent registered", {
+    stateId: state._stateId,
+    listeners: state.listeners.size,
+  });
+  return () => state.listeners.delete(listener);
 }
 
 export function resetDiagnosticEventsForTest(): void {
-  seq = 0;
-  listeners.clear();
+  const state = getGlobalDiagnosticState();
+  state.seq = 0;
+  state.listeners.clear();
 }
