@@ -74,10 +74,12 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
   let logProvider: LoggerProvider | null = null;
   let stopLogTransport: (() => void) | null = null;
   let unsubscribe: (() => void) | null = null;
+  let logger: { info: (msg: string) => void } | null = null;
 
   return {
     id: "diagnostics-otel",
     async start(ctx) {
+      logger = ctx.logger;
       const cfg = ctx.config.diagnostics;
       const otel = cfg?.otel;
       if (!cfg?.enabled || !otel?.enabled) {
@@ -110,6 +112,13 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const traceUrl = resolveOtelUrl(endpoint, "v1/traces");
       const metricUrl = resolveOtelUrl(endpoint, "v1/metrics");
       const logUrl = resolveOtelUrl(endpoint, "v1/logs");
+
+      ctx.logger.info(
+        `diagnostics-otel: configuration loaded - endpoint=${endpoint ?? "default"}, serviceName=${serviceName}, sampleRate=${sampleRate ?? "default"}`,
+      );
+      ctx.logger.info(
+        `diagnostics-otel: exporters - traces=${tracesEnabled ? (traceUrl ?? "default") : "disabled"}, metrics=${metricsEnabled ? (metricUrl ?? "default") : "disabled"}, logs=${logsEnabled ? (logUrl ?? "default") : "disabled"}`,
+      );
       const traceExporter = tracesEnabled
         ? new OTLPTraceExporter({
             ...(traceUrl ? { url: traceUrl } : {}),
@@ -149,6 +158,15 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
 
         try {
           await sdk.start();
+          ctx.logger.info("diagnostics-otel: OpenTelemetry SDK started successfully");
+          if (tracesEnabled) {
+            ctx.logger.info(`diagnostics-otel: traces exporter initialized - url=${traceUrl}`);
+          }
+          if (metricsEnabled) {
+            ctx.logger.info(
+              `diagnostics-otel: metrics exporter initialized - url=${metricUrl}, flushInterval=${otel.flushIntervalMs ?? "default"}ms`,
+            );
+          }
         } catch (err) {
           ctx.logger.error(`diagnostics-otel: failed to start SDK: ${formatError(err)}`);
           throw err;
@@ -616,25 +634,47 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
         queueDepthHistogram.record(evt.queued, { "openclaw.channel": "heartbeat" });
       };
 
+      let eventCounter = 0;
       unsubscribe = onDiagnosticEvent((evt: DiagnosticEventPayload) => {
         try {
+          eventCounter++;
+          if (eventCounter % 10 === 0) {
+            ctx.logger.debug(
+              `diagnostics-otel: processed ${eventCounter} events (latest: ${evt.type})`,
+            );
+          }
           switch (evt.type) {
             case "model.usage":
+              ctx.logger.debug(
+                `diagnostics-otel: model.usage - provider=${evt.provider}, model=${evt.model}, tokens=${evt.usage.total ?? 0}`,
+              );
               recordModelUsage(evt);
               return;
             case "webhook.received":
+              ctx.logger.debug(
+                `diagnostics-otel: webhook.received - channel=${evt.channel}, type=${evt.updateType}`,
+              );
               recordWebhookReceived(evt);
               return;
             case "webhook.processed":
+              ctx.logger.debug(
+                `diagnostics-otel: webhook.processed - channel=${evt.channel}, duration=${evt.durationMs}ms`,
+              );
               recordWebhookProcessed(evt);
               return;
             case "webhook.error":
               recordWebhookError(evt);
               return;
             case "message.queued":
+              ctx.logger.debug(
+                `diagnostics-otel: message.queued - channel=${evt.channel}, queueDepth=${evt.queueDepth}`,
+              );
               recordMessageQueued(evt);
               return;
             case "message.processed":
+              ctx.logger.debug(
+                `diagnostics-otel: message.processed - channel=${evt.channel}, outcome=${evt.outcome}, duration=${evt.durationMs}ms`,
+              );
               recordMessageProcessed(evt);
               return;
             case "queue.lane.enqueue":
@@ -664,22 +704,31 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       });
 
       if (logsEnabled) {
-        ctx.logger.info("diagnostics-otel: logs exporter enabled (OTLP/Protobuf)");
+        ctx.logger.info(
+          `diagnostics-otel: logs exporter enabled (OTLP/Protobuf) - url=${logUrl}, flushInterval=${otel.flushIntervalMs ?? "default"}ms`,
+        );
       }
+
+      ctx.logger.info("diagnostics-otel: service started, monitoring diagnostic events");
     },
     async stop() {
+      logger?.info("diagnostics-otel: stopping service");
       unsubscribe?.();
       unsubscribe = null;
       stopLogTransport?.();
       stopLogTransport = null;
       if (logProvider) {
+        logger?.info("diagnostics-otel: shutting down log provider");
         await logProvider.shutdown().catch(() => undefined);
         logProvider = null;
       }
       if (sdk) {
+        logger?.info("diagnostics-otel: shutting down OpenTelemetry SDK");
         await sdk.shutdown().catch(() => undefined);
         sdk = null;
       }
+      logger?.info("diagnostics-otel: service stopped");
+      logger = null;
     },
   } satisfies OpenClawPluginService;
 }
